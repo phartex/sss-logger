@@ -1,0 +1,608 @@
+SERVER-SENT EVENTS LIVE LOG VIEWER
+Setup steps from scratch on macOS
+==================================
+
+WHAT YOU ARE BUILDING
+---------------------
+- A small SSE (Server-Sent Events) server in Node.js on port 4000.
+- A React + TypeScript frontend on port 3000.
+- The frontend connects to the SSE stream, displays live logs, filters by
+  severity (ALL / INFO / WARN / ERROR), and reconnects with exponential backoff.
+- Vitest + React Testing Library tests.
+
+FINAL FOLDER STRUCTURE
+----------------------
+server-sent-events/
+  public/
+    index.html
+  src/
+    LiveLogViewer.tsx
+    LiveLogViewer.test.tsx
+    index.tsx
+    react-app-env.d.ts
+  server.js
+  package.json
+  tsconfig.json
+  vitest.config.mts
+  vitest.setup.ts
+
+STEP 0 - CHECK PREREQUISITES
+----------------------------
+Open Terminal and run:
+
+  node -v
+  npm -v
+
+This project was built with Node 24 and npm 11. Node 18+ should also work,
+but Node 20 or newer is recommended.
+
+If Node is not installed, install it from https://nodejs.org or with Homebrew:
+
+  brew install node
+
+STEP 1 - CREATE A NEW PROJECT FOLDER
+------------------------------------
+Choose where you want the new project (for example Desktop or Documents):
+
+  cd ~/Documents
+  mkdir server-sent-events
+  cd server-sent-events
+
+Create the folders:
+
+  mkdir -p public src
+
+STEP 2 - CREATE package.json
+----------------------------
+Create a file named package.json in the project root with this exact content:
+
+{
+  "name": "server-sent-events",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-scripts": "^5.0.1"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "jsdom": "^30.1.3",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "start:mock-sse": "node server.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}
+
+Important: TypeScript 5.9 is required. The @types/node package pulled in by
+Vitest/Vite uses modern syntax that TypeScript 4.9 (bundled with
+react-scripts) cannot parse, which causes errors in node_modules/@types/node.
+
+If you prefer to install packages with commands instead of writing
+package.json by hand, run:
+
+  npm init -y
+  npm install react@^19.3.1 react-dom@^19.3.1 react-scripts@^5.0.1
+  npm install -D @testing-library/dom@^10.4.2 @testing-library/jest-dom@^7.0.1 @testing-library/react@^16.3.3 @types/react@^19.3.0 @types/react-dom@^19.3.0 @vitejs/plugin-react@^6.1.2 jsdom@^30.1.3 typescript@^5.9.3 vitest@^5.0.5
+
+Then add the "scripts" and "browserslist" sections from the package.json
+above. The command "npm ls typescript" may show an "invalid" peer warning
+because react-scripts@5 declares "typescript ^4"; this is expected and the
+build still works.
+
+STEP 3 - INSTALL DEPENDENCIES
+-----------------------------
+In the project root run:
+
+  npm install
+
+This creates node_modules/ and package-lock.json. Do not commit or zip
+node_modules; it can be recreated with npm install.
+
+STEP 4 - CREATE public/index.html
+---------------------------------
+File: public/index.html
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta name="description" content="Live system logs streamed over Server-Sent Events" />
+    <title>Live Logs (SSE)</title>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+  </body>
+</html>
+
+STEP 5 - CREATE src/index.tsx
+-----------------------------
+File: src/index.tsx
+
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { LiveLogViewer } from './LiveLogViewer';
+
+const root = ReactDOM.createRoot(
+  document.getElementById('root') as HTMLElement
+);
+
+root.render(
+  <React.StrictMode>
+    <LiveLogViewer />
+  </React.StrictMode>
+);
+
+STEP 6 - CREATE src/react-app-env.d.ts
+--------------------------------------
+File: src/react-app-env.d.ts
+
+/// <reference types="react-scripts" />
+
+STEP 7 - CREATE src/LiveLogViewer.tsx
+-------------------------------------
+File: src/LiveLogViewer.tsx
+
+import React, { useState, useEffect, useRef } from 'react';
+
+// TypeScript Interface for Log Entries
+export interface LogEntry {
+    id: string;
+    timestamp: string;
+    level: 'INFO' | 'WARN' | 'ERROR';
+    message: string;
+}
+
+type ConnectionStatus = 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED';
+
+export const LiveLogViewer: React.FC = () => {
+    const [logs, setLogs] = useState<LogEntry[]>([]);
+    const [filter, setFilter] = useState<'ALL' | 'INFO' | 'WARN' | 'ERROR'>('ALL');
+    const [status, setStatus] = useState<ConnectionStatus>('DISCONNECTED');
+
+    const retryDelayRef = useRef<number>(1000); // Initial 1s retry delay
+    const eventSourceRef = useRef<EventSource | null>(null);
+
+    useEffect(() => {
+        let timerId: ReturnType<typeof setTimeout>;
+
+        const connectSSE = () => {
+            setStatus('RECONNECTING');
+
+            // Connect to the mock SSE endpoint
+            const es = new EventSource('http://localhost:4000/api/logs');
+            eventSourceRef.current = es;
+
+            es.onopen = () => {
+                setStatus('CONNECTED');
+                retryDelayRef.current = 1000; // Reset exponential backoff on successful connection
+            };
+
+            es.onmessage = (event) => {
+                try {
+                    const newLog: LogEntry = JSON.parse(event.data);
+                    setLogs((prevLogs) => [newLog, ...prevLogs.slice(0, 99)]); // Keep latest 100 logs
+                } catch (err) {
+                    console.error('Failed to parse log event:', err);
+                }
+            };
+
+            es.onerror = () => {
+                setStatus('DISCONNECTED');
+                es.close();
+
+                // Exponential backoff logic: 1s -> 2s -> 4s (capped at 8s)
+                const nextDelay = retryDelayRef.current;
+                retryDelayRef.current = Math.min(retryDelayRef.current * 2, 8000);
+
+                console.log(`Connection lost. Retrying in ${nextDelay / 1000} seconds...`);
+                timerId = setTimeout(connectSSE, nextDelay);
+            };
+        };
+
+        connectSSE();
+
+        // Cleanup on component unmount
+        return () => {
+            if (eventSourceRef.current) {
+                eventSourceRef.current.close();
+            }
+            clearTimeout(timerId);
+        };
+    }, []);
+
+    // Filter logs by selected severity level
+    const filteredLogs = logs.filter((log) => {
+        if (filter === 'ALL') return true;
+        return log.level === filter;
+    });
+
+    return (
+        <div style={{ padding: '20px', fontFamily: 'monospace', maxWidth: '800px', margin: '0 auto' }}>
+            <h2>Live System Logs (SSE)</h2>
+
+            {/* Connection Status Badge */}
+            <div style={{ marginBottom: '15px' }}>
+                <strong>Status: </strong>
+                <span
+                    style={{
+                        padding: '4px 8px',
+                        borderRadius: '4px',
+                        color: '#fff',
+                        backgroundColor:
+                            status === 'CONNECTED' ? '#2e7d32' : status === 'RECONNECTING' ? '#ed6c02' : '#d32f2f',
+                    }}
+                >
+                    {status}
+                </span>
+            </div>
+
+            {/* Severity Filter Buttons */}
+            <div style={{ marginBottom: '15px', display: 'flex', gap: '8px' }}>
+                {(['ALL', 'INFO', 'WARN', 'ERROR'] as const).map((level) => (
+                    <button
+                        key={level}
+                        onClick={() => setFilter(level)}
+                        style={{
+                            padding: '6px 12px',
+                            cursor: 'pointer',
+                            fontWeight: filter === level ? 'bold' : 'normal',
+                            border: filter === level ? '2px solid #1976d2' : '1px solid #ccc',
+                        }}
+                    >
+                        {level}
+                    </button>
+                ))}
+            </div>
+
+            {/* Log Feed */}
+            <div
+                style={{
+                    border: '1px solid #ccc',
+                    borderRadius: '4px',
+                    height: '400px',
+                    overflowY: 'auto',
+                    padding: '10px',
+                    backgroundColor: '#1e1e1e',
+                    color: '#f1f1f1',
+                }}
+            >
+                {filteredLogs.length === 0 ? (
+                    <p>No log events received yet...</p>
+                ) : (
+                    filteredLogs.map((log) => (
+                        <div key={log.id} style={{ marginBottom: '6px', fontSize: '13px' }}>
+                            <span style={{ color: '#888', marginRight: '8px' }}>[{log.timestamp}]</span>
+                            <span
+                                style={{
+                                    fontWeight: 'bold',
+                                    marginRight: '8px',
+                                    color:
+                                        log.level === 'ERROR' ? '#ff5252' : log.level === 'WARN' ? '#ffd740' : '#69f0ae',
+                                }}
+                            >
+                                [{log.level}]
+                            </span>
+                            <span>{log.message}</span>
+                        </div>
+                    ))
+                )}
+            </div>
+        </div>
+    );
+};
+
+STEP 8 - CREATE server.js
+-------------------------
+File: server.js
+
+const http = require('http');
+
+const PORT = 4000;
+
+const server = http.createServer((req, res) => {
+  // Set headers for Server-Sent Events (SSE)
+  if (req.url === '/api/logs') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*', // Allow cross-origin requests from your frontend
+    });
+
+    // Send an initial connection message
+    const initialLog = {
+      id: Date.now().toString(),
+      timestamp: new Date().toLocaleTimeString(),
+      level: 'INFO',
+      message: 'SSE Stream connected successfully.',
+    };
+    res.write(`data: ${JSON.stringify(initialLog)}\n\n`);
+
+    // Periodically send mock log events every 3 seconds
+    const intervalId = setInterval(() => {
+      const levels = ['INFO', 'WARN', 'ERROR'];
+      const messages = [
+        'User authentication successful',
+        'Database query latency exceeded threshold',
+        'Failed to process transaction payload',
+        'Cache invalidated for user session',
+        'Incoming webhook received from gateway',
+      ];
+
+      const randomLevel = levels[Math.floor(Math.random() * levels.length)];
+      const randomMessage = messages[Math.floor(Math.random() * messages.length)];
+
+      const logEntry = {
+        id: Date.now().toString(),
+        timestamp: new Date().toLocaleTimeString(),
+        level: randomLevel,
+        message: randomMessage,
+      };
+
+      res.write(`data: ${JSON.stringify(logEntry)}\n\n`);
+    }, 3000);
+
+    // Clean up interval if client disconnects
+    req.on('close', () => {
+      clearInterval(intervalId);
+      res.end();
+    });
+  } else {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not Found');
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`Mock SSE Server running at http://localhost:${PORT}/api/logs`);
+});
+
+STEP 9 - CREATE tsconfig.json
+-----------------------------
+File: tsconfig.json
+
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["DOM", "DOM.Iterable", "ES2020"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx"
+  },
+  "include": ["src"]
+}
+
+STEP 10 - CREATE vitest.config.mts
+----------------------------------
+The .mts extension keeps Vite from loading this config as CommonJS.
+
+File: vitest.config.mts
+
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./vitest.setup.ts'],
+  },
+});
+
+STEP 11 - CREATE vitest.setup.ts
+--------------------------------
+jsdom does not provide EventSource, so the test setup replaces it with a
+minimal mock. This file also cleans up the DOM after every test.
+
+File: vitest.setup.ts
+
+import '@testing-library/jest-dom/vitest';
+import { afterEach } from 'vitest';
+import { cleanup } from '@testing-library/react';
+
+class MockEventSource {
+  readonly url: string;
+  readonly withCredentials = false;
+  readonly CONNECTING = 0;
+  readonly OPEN = 1;
+  readonly CLOSED = 2;
+  readyState = 0;
+  onopen: ((this: EventSource, ev: Event) => unknown) | null = null;
+  onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null = null;
+  onerror: ((this: EventSource, ev: Event) => unknown) | null = null;
+
+  constructor(url: string | URL) {
+    this.url = url.toString();
+  }
+
+  close() {
+    this.readyState = this.CLOSED;
+  }
+
+  addEventListener() {}
+  removeEventListener() {}
+  dispatchEvent() {
+    return true;
+  }
+}
+
+globalThis.EventSource = MockEventSource as unknown as typeof EventSource;
+
+afterEach(() => {
+  cleanup();
+});
+
+STEP 12 - CREATE src/LiveLogViewer.test.tsx
+-------------------------------------------
+File: src/LiveLogViewer.test.tsx
+
+import '@testing-library/jest-dom/vitest';
+import { render, screen } from '@testing-library/react';
+import { describe, it, expect } from 'vitest';
+import { LiveLogViewer } from './LiveLogViewer';
+
+describe('LiveLogViewer Component', () => {
+  it('renders the dashboard title and initial connection status', () => {
+    render(<LiveLogViewer />);
+
+    expect(screen.getByText(/Live System Logs/i)).toBeInTheDocument();
+    expect(screen.getByText(/Status:/i)).toBeInTheDocument();
+  });
+
+  it('renders severity filter buttons', () => {
+    render(<LiveLogViewer />);
+
+    expect(screen.getByRole('button', { name: 'ALL' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'INFO' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'WARN' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'ERROR' })).toBeInTheDocument();
+  });
+});
+
+STEP 13 - RUN THE SSE SERVER
+----------------------------
+Open Terminal window 1 in the project root and run:
+
+  npm run start:mock-sse
+
+Expected output:
+
+  Mock SSE Server running at http://localhost:4000/api/logs
+
+Quick check in another terminal or browser:
+
+  curl -N http://localhost:4000/api/logs
+
+You should see "data: {...}" lines arriving every 3 seconds. Press Ctrl+C
+to stop the curl command.
+
+STEP 14 - RUN THE REACT APP
+---------------------------
+Open Terminal window 2 in the project root and run:
+
+  npm start
+
+It opens http://localhost:3000 automatically. Keep the SSE server from
+Step 13 running at the same time. The status badge should show CONNECTED
+and new logs should appear every 3 seconds.
+
+If the browser does not open automatically, visit:
+
+  http://localhost:3000
+
+STEP 15 - RUN TESTS
+-------------------
+In a terminal in the project root:
+
+  npm test
+
+Expected result:
+
+  Test Files  1 passed (1)
+       Tests  2 passed (2)
+
+Use "npm run test:watch" for watch mode.
+
+STEP 16 - CREATE A PRODUCTION BUILD
+-----------------------------------
+  npm run build
+
+The optimized output is written to build/.
+
+You can preview it with any static server, for example:
+
+  npx serve -s build
+
+STEP 17 - OPTIONAL TYPE CHECK
+-----------------------------
+  npx tsc --noEmit
+
+This should finish with no output and exit code 0.
+
+TROUBLESHOOTING
+---------------
+1. "Could not find a required file. Name: index.html"
+   You are missing public/index.html. Run react-scripts from the project
+   root and make sure the file from Step 4 exists.
+
+2. "EADDRINUSE: address already in use :::4000"
+   Another process is using port 4000. Find and stop it:
+
+     lsof -ti:4000 | xargs kill
+
+   Then run "npm run start:mock-sse" again.
+
+3. Status stays DISCONNECTED or RECONNECTING
+   - Make sure the SSE server is running on port 4000.
+   - Check http://localhost:4000/api/logs in a browser.
+   - The frontend connects to http://localhost:4000/api/logs exactly.
+
+4. Errors from node_modules/@types/node/ffi.d.ts after running tsc
+   Your TypeScript is too old. Install TypeScript 5.9 or newer:
+
+     npm install -D typescript@^5.9.3
+
+5. Tests fail with "EventSource is not defined"
+   Make sure vitest.setup.ts exists and is listed in vitest.config.mts
+   under test.setupFiles.
+
+6. npm warns about typescript peer dependency with react-scripts@5
+   This is expected because react-scripts declares TypeScript ^4. The
+   project uses TypeScript 5.9 and the build/test commands work.
+
+7. npm warns about 34 vulnerabilities
+   These come from react-scripts@5 and its old dependency tree. Do not run
+   "npm audit fix --force" because it can break the toolchain.
+
+USEFUL COMMANDS SUMMARY
+-----------------------
+  npm install               install dependencies
+  npm run start:mock-sse    start the Node SSE server on port 4000
+  npm start                 start the React app on port 3000
+  npm test                  run tests once
+  npm run test:watch        run tests in watch mode
+  npm run build             production build
+  npx tsc --noEmit          type check only
+
+WHAT TO ZIP FOR DELIVERY
+------------------------
+Include the project source files, but exclude node_modules/ and build/.
+For the Mercor-style submission, place the whole project inside a folder
+named "final output 1" and zip that folder as Deliverables.zip.
